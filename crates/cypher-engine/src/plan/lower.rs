@@ -618,21 +618,12 @@ fn lower_query(query: &Query) -> GraphPlanResult<GraphLogicalPlan> {
     // named, and what the lowering named for it.
     reject_synthesized_collisions(&declared, &synthesized)?;
     let mut plan = plan.unwrap_or(GraphLogicalPlan::SingleRow);
-    let items = &star_expanded(&returned.items, &visible, "RETURN")?;
-    {
-        // Validate every result reference, including initial OPTIONAL MATCH.
-        for item in items {
-            check_scope(&item.expression, &visible, "RETURN")?;
-        }
-        // ORDER BY at the result may also name a column the projection just
-        // created, which is not a binding at all.
-        let mut sortable = visible.clone();
-        sortable.extend(item_aliases(items));
-        for item in &returned.order_by {
-            check_scope(&item.expression, &sortable, "ORDER BY")?;
-        }
+    let projected = star_expanded(&returned.items, &visible, "RETURN")?;
+    // Validate every result reference, including initial OPTIONAL MATCH.
+    for item in &projected {
+        check_scope(&item.expression, &visible, "RETURN")?;
     }
-    let items = items
+    let items = projected
         .iter()
         .map(|item| {
             Ok(LogicalProjection {
@@ -644,7 +635,26 @@ fn lower_query(query: &Query) -> GraphPlanResult<GraphLogicalPlan> {
             })
         })
         .collect::<GraphPlanResult<Vec<_>>>()?;
-
+    let aggregates = items
+        .iter()
+        .any(|item| contains_aggregate(&item.expression));
+    let distinct = matches!(returned.quantifier, Some(SetQuantifier::Distinct));
+    {
+        // An aggregating or DISTINCT RETURN sorts projected rows, so its
+        // ORDER BY cannot reference dropped bindings.
+        if aggregates || distinct {
+            let scope = ProjectedScope::new(&projected);
+            for item in &returned.order_by {
+                check_sort_key_scope(&item.expression, &scope)?;
+            }
+        } else {
+            let mut sortable = visible.clone();
+            sortable.extend(item_aliases(&projected));
+            for item in &returned.order_by {
+                check_scope(&item.expression, &sortable, "ORDER BY")?;
+            }
+        }
+    }
     let sort_items = returned
         .order_by
         .iter()
@@ -658,16 +668,12 @@ fn lower_query(query: &Query) -> GraphPlanResult<GraphLogicalPlan> {
             })
         })
         .collect::<GraphPlanResult<Vec<_>>>()?;
-    let aggregates = items
-        .iter()
-        .any(|item| contains_aggregate(&item.expression));
     if !aggregates && !sort_items.is_empty() {
         plan = GraphLogicalPlan::Sort {
             input: Box::new(plan),
             items: sort_items.clone(),
         };
     }
-    let distinct = matches!(returned.quantifier, Some(SetQuantifier::Distinct));
     // SKIP and LIMIT count result rows. Aggregation and DISTINCT both change
     // how many rows there are, so their window applies after the projection,
     // never to the binding rows beneath it.
@@ -1568,6 +1574,131 @@ fn check_scope(
         }
     }
     Ok(())
+}
+
+/// Scope of bindings and expressions produced by a RETURN projection.
+struct ProjectedScope {
+    names: BTreeSet<Symbol>,
+    expressions: Vec<Expression>,
+}
+
+impl ProjectedScope {
+    fn new(items: &[Projection]) -> Self {
+        let mut names = BTreeSet::new();
+        let mut expressions = Vec::with_capacity(items.len());
+        for item in items {
+            match (&item.alias, &item.expression) {
+                (Some(alias), _) => {
+                    names.insert(Symbol::from(alias.as_str()));
+                }
+                (None, Expression::Identifier(name)) => {
+                    names.insert(Symbol::from(name.as_str()));
+                }
+                (None, _) => {}
+            }
+            expressions.push(item.expression.clone());
+        }
+        Self { names, expressions }
+    }
+}
+
+enum SortKeyScope {
+    Readable,
+    Dropped(Symbol),
+    Unreadable,
+}
+
+impl SortKeyScope {
+    fn first_unreadable(self, other: SortKeyScope) -> SortKeyScope {
+        match self {
+            SortKeyScope::Readable => other,
+            unreadable => unreadable,
+        }
+    }
+}
+
+fn sort_key_scope(expression: &Expression, projected: &ProjectedScope) -> SortKeyScope {
+    if is_count_star(expression) {
+        return SortKeyScope::Readable;
+    }
+    if projected
+        .expressions
+        .iter()
+        .any(|projected_expression| projected_expression == expression)
+    {
+        return SortKeyScope::Readable;
+    }
+    match expression {
+        Expression::Identifier(name) => {
+            let name = Symbol::from(name.as_str());
+            if projected.names.contains(&name) {
+                SortKeyScope::Readable
+            } else {
+                SortKeyScope::Dropped(name)
+            }
+        }
+        Expression::Property { target, .. } => sort_key_scope(target, projected),
+        Expression::Function { arguments, .. } => arguments
+            .iter()
+            .map(|argument| sort_key_scope(argument, projected))
+            .fold(SortKeyScope::Readable, SortKeyScope::first_unreadable),
+        Expression::Unary { expression, .. } => sort_key_scope(expression, projected),
+        Expression::Binary { left, right, .. } => {
+            sort_key_scope(left, projected).first_unreadable(sort_key_scope(right, projected))
+        }
+        Expression::List(items) => items
+            .iter()
+            .map(|item| sort_key_scope(item, projected))
+            .fold(SortKeyScope::Readable, SortKeyScope::first_unreadable),
+        Expression::Map(entries) => entries
+            .iter()
+            .map(|(_, value)| sort_key_scope(value, projected))
+            .fold(SortKeyScope::Readable, SortKeyScope::first_unreadable),
+        Expression::Case {
+            operand,
+            branches,
+            default,
+        } => operand
+            .as_deref()
+            .map(|operand| sort_key_scope(operand, projected))
+            .unwrap_or(SortKeyScope::Readable)
+            .first_unreadable(
+                branches
+                    .iter()
+                    .map(|(when, then)| {
+                        sort_key_scope(when, projected)
+                            .first_unreadable(sort_key_scope(then, projected))
+                    })
+                    .fold(SortKeyScope::Readable, SortKeyScope::first_unreadable),
+            )
+            .first_unreadable(
+                default
+                    .as_deref()
+                    .map(|default| sort_key_scope(default, projected))
+                    .unwrap_or(SortKeyScope::Readable),
+            ),
+        Expression::Parameter(_) | Expression::Literal(_) => SortKeyScope::Readable,
+        Expression::Syntax(_) => SortKeyScope::Unreadable,
+    }
+}
+
+fn check_sort_key_scope(
+    expression: &Expression,
+    projected: &ProjectedScope,
+) -> GraphPlanResult<()> {
+    match sort_key_scope(expression, projected) {
+        SortKeyScope::Readable => Ok(()),
+        SortKeyScope::Dropped(binding) => Err(GraphPlanError::UnsupportedCypher(
+            QueryFailureReason::Return,
+            format!(
+                "ORDER BY after RETURN references binding {binding}, which the RETURN does not project"
+            ),
+        )),
+        SortKeyScope::Unreadable => Err(GraphPlanError::UnsupportedCypher(
+            QueryFailureReason::Return,
+            "ORDER BY after RETURN reads syntax this engine cannot scope-check".to_string(),
+        )),
+    }
 }
 
 /// Lower one path pattern.
